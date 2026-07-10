@@ -16,6 +16,10 @@ lint:
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
 
+# Audit Cargo.lock for known RUSTSEC vulnerabilities (requires: cargo install cargo-audit)
+audit:
+    cargo audit
+
 # Run PR CI checks
 ci filter='all()': lint
     cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
