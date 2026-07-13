@@ -169,7 +169,52 @@ def infer_protocol_from_notes(notes: str) -> int | None:
     return int(match.group(1))
 
 
-def normalize_assets(value: Any, label: str) -> dict[str, str]:
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def extract_sha256(digest: Any) -> str | None:
+    """Return a lowercase 64-char sha256 hex digest from a GitHub asset digest.
+
+    GitHub release assets expose ``digest`` as ``"sha256:<hex>"``. Older or
+    custom payloads may omit it; this helper tolerates a bare hex string and
+    rejects anything that is not a valid 64-char sha256 so malformed digests
+    never silently reach the client.
+    """
+    if not isinstance(digest, str):
+        return None
+    value = digest.strip()
+    if value.lower().startswith("sha256:"):
+        value = value[len("sha256:") :]
+    value = value.strip().lower()
+    return value if _SHA256_HEX_RE.fullmatch(value) else None
+
+
+def normalize_asset_entry(entry: Any, label: str) -> dict[str, str]:
+    """Normalize one asset value to an object ``{"url", "sha256"?}``.
+
+    Accepts the legacy URL-string form and the object form used by preview
+    manifests, mirroring the Rust ``AssetRef`` deserializer so server and
+    client agree on the shape. ``sha256`` is only emitted when present and
+    well-formed (64 lowercase hex chars).
+    """
+    if isinstance(entry, str):
+        url = entry.strip()
+        if not url:
+            raise ChangelogError(f"{label} is missing asset URL")
+        return {"url": url}
+    if isinstance(entry, dict):
+        url = entry.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ChangelogError(f"{label} is missing asset URL")
+        asset: dict[str, str] = {"url": url.strip()}
+        sha = extract_sha256(entry.get("sha256"))
+        if sha:
+            asset["sha256"] = sha
+        return asset
+    raise ChangelogError(f"{label} must be a URL string or object with url")
+
+
+def normalize_assets(value: Any, label: str) -> dict[str, dict[str, str]]:
     if not isinstance(value, dict):
         raise ChangelogError(f"{label} must be an object")
 
@@ -177,13 +222,22 @@ def normalize_assets(value: Any, label: str) -> dict[str, str]:
     if missing_targets:
         raise ChangelogError(f"{label} is missing asset URL for {', '.join(missing_targets)}")
 
-    normalized_assets: dict[str, str] = {}
+    normalized_assets: dict[str, dict[str, str]] = {}
     for target in ASSET_TARGETS:
-        url = value.get(target)
-        if not isinstance(url, str) or not url.strip():
-            raise ChangelogError(f"{label} is missing asset URL for {target}")
-        normalized_assets[target] = url.strip()
+        normalized_assets[target] = normalize_asset_entry(value.get(target), f"{label}.{target}")
     return normalized_assets
+
+
+def strip_asset_sha256(assets: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+    """Drop the ``sha256`` field from each asset, keeping only ``url``.
+
+    Used when comparing manifests for release verification: the integrity
+    hash is derived from the binary, so URL/notes/protocol identity is enough
+    to confirm a manifest points at the right release. Stripping lets an older
+    manifest (URL strings, no sha256) compare equal to a fresh one (objects
+    with sha256) for the same release.
+    """
+    return {target: {"url": entry["url"]} for target, entry in assets.items()}
 
 
 def normalize_release_metadata(value: Any, label: str, version: str) -> dict[str, Any]:
@@ -242,7 +296,7 @@ def normalize_releases(value: Any) -> dict[str, dict[str, Any]]:
 def build_latest_json(
     version: str,
     notes: str,
-    assets: dict[str, str],
+    assets: dict[str, Any],
     protocol: int | None = None,
     announcement: dict[str, str] | None = None,
     releases: dict[str, Any] | None = None,
@@ -284,11 +338,11 @@ def build_latest_json(
     return json.dumps(manifest, indent=2) + "\n"
 
 
-def default_release_assets(version: str, repo: str = DEFAULT_RELEASE_REPO) -> dict[str, str]:
+def default_release_assets(version: str, repo: str = DEFAULT_RELEASE_REPO) -> dict[str, dict[str, str]]:
     normalized_version = normalize_version(version)
     tag = f"v{normalized_version}"
     return {
-        target: f"https://github.com/{repo}/releases/download/{tag}/{EXPECTED_ASSET_NAMES[target]}"
+        target: {"url": f"https://github.com/{repo}/releases/download/{tag}/{EXPECTED_ASSET_NAMES[target]}"}
         for target in ASSET_TARGETS
     }
 
@@ -322,7 +376,7 @@ def manifest_from_release_payload(
             if isinstance(name, str) and name not in release_assets:
                 release_assets[name] = asset
 
-    manifest_assets: dict[str, str] = {}
+    manifest_assets: dict[str, dict[str, str]] = {}
     for target, asset_name in EXPECTED_ASSET_NAMES.items():
         asset = release_assets.get(asset_name)
         if not isinstance(asset, dict):
@@ -330,7 +384,14 @@ def manifest_from_release_payload(
         url = str(asset.get("url") or "").strip()
         if not url:
             raise ChangelogError(f"GitHub release asset {asset_name} is missing a download URL")
-        manifest_assets[target] = url
+        entry: dict[str, str] = {"url": url}
+        # GitHub computes a sha256 digest for every uploaded release asset.
+        # Carry it into the manifest so clients can verify downloads end to
+        # end; omit it only if GitHub did not expose a usable digest.
+        sha = extract_sha256(asset.get("digest"))
+        if sha:
+            entry["sha256"] = sha
+        manifest_assets[target] = entry
 
     return {
         "version": normalized_version,
@@ -363,7 +424,10 @@ def canonicalize_manifest(manifest: dict[str, Any], label: str) -> dict[str, Any
         "version": normalize_version(version),
         "protocol": protocol,
         "notes": notes.strip(),
-        "assets": normalized_assets,
+        # Comparison identity is URL/notes/protocol; the sha256 integrity
+        # field is intentionally dropped so legacy and fresh manifests for
+        # the same release compare equal.
+        "assets": strip_asset_sha256(normalized_assets),
     }
 
 
@@ -516,9 +580,10 @@ def fetch_remote_json(url: str, label: str) -> dict[str, Any]:
     return payload
 
 
-def verify_asset_urls_resolve(assets: dict[str, str], label: str) -> None:
+def verify_asset_urls_resolve(assets: dict[str, Any], label: str) -> None:
     for target in ASSET_TARGETS:
-        url = assets[target]
+        entry = assets[target]
+        url = entry["url"] if isinstance(entry, dict) else str(entry)
         command = [
             "curl",
             "-fsSIL",

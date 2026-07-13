@@ -1401,6 +1401,15 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
     let asset_key = platform.asset_key();
     let asset = remote_release_asset(&asset_key)?;
 
+    // Remote bootstrap installs a Herdr binary on the remote host, so the
+    // download must be integrity-checked just like self-update. Require a
+    // sha256 from the manifest and refuse unverified assets.
+    let expected_sha256 = asset.sha256.as_ref().ok_or_else(|| {
+        io::Error::other(
+            "remote update manifest did not provide a sha256 checksum for the asset; refusing to install an unverified binary",
+        )
+    })?;
+
     let dir = private_download_dir(&asset_key)?;
     let path = dir.join("herdr.tmp");
     let status = Command::new("curl")
@@ -1413,14 +1422,12 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
         let _ = fs::remove_dir_all(&dir);
         return Err(io::Error::other("download failed"));
     }
-    if let Some(expected) = &asset.sha256 {
-        if let Err(err) = crate::checksum::verify_sha256(&path, expected) {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(io::Error::new(
-                err.kind(),
-                format!("downloaded remote asset checksum verification failed: {err}"),
-            ));
-        }
+    if let Err(err) = crate::checksum::verify_sha256(&path, expected_sha256) {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(io::Error::new(
+            err.kind(),
+            format!("downloaded remote asset checksum verification failed: {err}"),
+        ));
     }
 
     Ok(InstallSource::temporary(path, dir))
@@ -1528,7 +1535,17 @@ fn private_download_dir(asset_key: &str) -> io::Result<PathBuf> {
             asset_key
         ));
         match fs::create_dir(&dir) {
-            Ok(()) => return Ok(dir),
+            Ok(()) => {
+                // Force 0700 so the staged remote binary is private even on
+                // hosts with a permissive umask; the temp file written inside
+                // is then readable/writable only by this process.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+                }
+                return Ok(dir);
+            }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
         }
@@ -3012,5 +3029,26 @@ mod tests {
         InstallSource::temporary(path, dir.clone()).cleanup();
 
         assert!(!dir.exists());
+    }
+
+    // M2: the staged remote binary must live in a private directory so other
+    // users cannot read or tamper with it, even on hosts with a permissive
+    // umask. The dir is forced to 0700 regardless of the process umask.
+    #[test]
+    fn private_download_dir_is_owner_private_regardless_of_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = private_download_dir("unit-test").expect("create private download dir");
+        let mode = fs::metadata(&dir)
+            .expect("stat private dir")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "private download dir must be 0700, got {:o}",
+            mode
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

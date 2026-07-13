@@ -567,8 +567,17 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
     }
     let _ = fs::remove_file(&test_path);
 
-    // Unique temp file (avoids races with concurrent instances)
-    let tmp_path = parent.join(format!(".herdr-update-{}.tmp", std::process::id()));
+    // Integrity is mandatory for self-update: we replace the running binary,
+    // so an unverified download must never reach the install step. The update
+    // manifest is required to carry a sha256 for the chosen asset.
+    let expected_sha256 = required_asset_sha256(release)?;
+
+    // Claim an unpredictable, non-symlink temp path in the install directory
+    // (same filesystem, so the final rename stays atomic). The random suffix
+    // and exclusive create defeat symlink/pre-creation attacks when a less
+    // privileged actor can write to the install directory (for example
+    // `sudo herdr update` into a shared directory).
+    let tmp_path = claim_update_temp_path(parent)?;
 
     // Download the exact asset URL (pinned to the release we checked)
     let status = Command::new("curl")
@@ -583,15 +592,11 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         return Err("download failed".into());
     }
 
-    if let Some(expected) = &release.sha256 {
-        if let Err(e) = crate::checksum::verify_sha256(&tmp_path, expected) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!(
-                "downloaded update checksum verification failed: {e}"
-            ));
-        }
-        tracing::info!(sha256 = %expected, "downloaded update checksum verified");
+    if let Err(e) = crate::checksum::verify_sha256(&tmp_path, expected_sha256) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("downloaded update checksum verification failed: {e}"));
     }
+    tracing::info!(sha256 = %expected_sha256, "downloaded update checksum verified");
 
     // Make executable
     #[cfg(unix)]
@@ -607,6 +612,81 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         current_exe,
         tmp_path: Some(tmp_path),
     })
+}
+
+/// Resolve the mandatory integrity checksum for an update release.
+///
+/// Self-update replaces the running binary, so a release without a sha256 in
+/// the manifest is rejected rather than installed unverified.
+#[cfg(not(windows))]
+fn required_asset_sha256(release: &ReleaseInfo) -> Result<&str, String> {
+    release.sha256.as_deref().ok_or_else(|| {
+        "update manifest did not provide a sha256 checksum for the asset; refusing to install an unverified binary"
+            .to_string()
+    })
+}
+
+/// Exclusively create `dir/name` as a fresh regular file, never following a
+/// symlink that may already exist at that path.
+///
+/// On Unix the file is opened with `O_CREAT | O_EXCL | O_NOFOLLOW`: `O_EXCL`
+/// refuses any pre-existing entry, and `O_NOFOLLOW` makes a symlink fail as
+/// `ELOOP` instead of being followed. Returns the created path on success.
+#[cfg(not(windows))]
+fn claim_temp_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    let candidate = dir.join(name);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&candidate)?;
+        drop(file);
+    }
+    #[cfg(not(unix))]
+    {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)?;
+        drop(file);
+    }
+    Ok(candidate)
+}
+
+/// Claim a fresh, non-symlink temp file path in `dir` for the update download.
+///
+/// Each candidate name mixes the process id with high-resolution nanoseconds
+/// so it cannot be predicted, then [`claim_temp_path`] creates it exclusively.
+/// An attacker cannot pre-place a symlink at the exact path (name is
+/// unguessable) and cannot win a follow race (the open refuses symlinks). The
+/// caller reopens the path by name and truncates the freshly created file.
+#[cfg(not(windows))]
+fn claim_update_temp_path(dir: &Path) -> Result<PathBuf, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let pid = std::process::id();
+    // Retry a handful of times so a rare timestamp collision does not abort
+    // an otherwise valid update.
+    for _ in 0..16 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let name = format!(".herdr-update-{pid}-{nanos:016x}.tmp");
+        match claim_temp_path(dir, &name) {
+            Ok(path) => return Ok(path),
+            // A pre-existing file at this exact (unpredictable) name is almost
+            // always a same-nanosecond self-collision; try the next name. A
+            // symlink shows up as FilesystemLoop and is treated as a hard
+            // error rather than followed.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("cannot claim update temp file: {err}")),
+        }
+    }
+    Err("could not claim a unique update temp file after retries".into())
 }
 
 #[cfg(not(windows))]
@@ -3462,10 +3542,23 @@ mod tests {
                 "macos-x86_64",
                 "macos-aarch64",
             ] {
-                let url = assets
+                let asset_value = assets
                     .get(target)
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_else(|| panic!("missing asset URL for {version} {target}"));
+                    .unwrap_or_else(|| panic!("missing asset for release {version} {target}"));
+                // Assets may be URL strings (legacy manifests) or objects with
+                // a `url` field (current manifests that also carry sha256).
+                let url = asset_value
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| {
+                        asset_value
+                            .get("url")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("missing asset URL for release {version} {target}")
+                    });
                 assert!(
                     url.contains(&format!("/releases/download/v{version}/")),
                     "unexpected release URL for {version} {target}: {url}"
@@ -3476,5 +3569,118 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(not(windows))]
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-update-test-{}-{label}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // M1: self-update must refuse a release that carries no sha256 so an
+    // unverified binary can never replace the running executable.
+    #[cfg(not(windows))]
+    #[test]
+    fn required_asset_sha256_rejects_release_without_checksum() {
+        let release = fake_release("0.1.1", None);
+        let err = required_asset_sha256(&release).expect_err("missing sha256 should be rejected");
+        assert!(
+            err.contains("sha256"),
+            "error should explain the missing checksum: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn required_asset_sha256_accepts_release_with_checksum() {
+        let mut release = fake_release("0.1.1", None);
+        release.sha256 = Some("a".repeat(64));
+        let sha = required_asset_sha256(&release).expect("present sha256 should be accepted");
+        assert_eq!(sha, &"a".repeat(64));
+    }
+
+    // M2: the update temp file must be claimed exclusively and must never
+    // follow a pre-existing symlink an attacker placed in the install dir.
+    #[cfg(not(windows))]
+    #[test]
+    fn claim_temp_path_creates_regular_file() {
+        let dir = unique_test_dir("claim-regular");
+        let path = claim_temp_path(&dir, "asset.tmp").expect("claim should succeed");
+        assert!(path.starts_with(&dir));
+        let meta = fs::symlink_metadata(&path).expect("file should exist");
+        assert!(
+            meta.file_type().is_file(),
+            "claimed path must be a regular file, not a symlink"
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn claim_temp_path_refuses_pre_existing_symlink() {
+        let dir = unique_test_dir("claim-symlink");
+        let target = dir.join("evil-target");
+        fs::write(&target, b"pwned").unwrap();
+        let link = dir.join("asset.tmp");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let err = claim_temp_path(&dir, "asset.tmp").expect_err("symlink must be refused");
+        // O_NOFOLLOW surfaces a symlink as ELOOP (raw os error) on Unix; either
+        // way the claim must fail and never write through the symlink. The
+        // claim must fail and never write through the symlink.
+        assert!(
+            err.raw_os_error() == Some(libc::ELOOP)
+                || err.kind() == io::ErrorKind::AlreadyExists,
+            "unexpected error refusing symlink: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"pwned",
+            "symlink target must be untouched"
+        );
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&target);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn claim_update_temp_path_yields_unique_unpredictable_names() {
+        let dir = unique_test_dir("claim-update");
+        let first = claim_update_temp_path(&dir).expect("first claim should succeed");
+        let second = claim_update_temp_path(&dir).expect("second claim should succeed");
+
+        // Names embed the pid and a hex nanosecond suffix and must differ.
+        assert_ne!(first, second, "successive claims must use distinct names");
+        let pid = std::process::id();
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!(".herdr-update-{pid}-")),
+            "temp name should embed the pid: {}",
+            first.display()
+        );
+        for path in [first, second] {
+            assert!(
+                fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_file(),
+                "claimed path must be a regular file"
+            );
+            let _ = fs::remove_file(&path);
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -76,10 +76,10 @@ class ChangelogScriptTests(unittest.TestCase):
         self.assertEqual(
             manifest["assets"],
             {
-                "linux-x86_64": "https://github.com/ogulcancelik/herdr/releases/download/v0.1.1/herdr-linux-x86_64",
-                "linux-aarch64": "https://github.com/ogulcancelik/herdr/releases/download/v0.1.1/herdr-linux-aarch64",
-                "macos-x86_64": "https://github.com/ogulcancelik/herdr/releases/download/v0.1.1/herdr-macos-x86_64",
-                "macos-aarch64": "https://github.com/ogulcancelik/herdr/releases/download/v0.1.1/herdr-macos-aarch64",
+                "linux-x86_64": {"url": "https://github.com/ogulcancelik/herdr/releases/download/v0.1.1/herdr-linux-x86_64"},
+                "linux-aarch64": {"url": "https://github.com/ogulcancelik/herdr/releases/download/v0.1.1/herdr-linux-aarch64"},
+                "macos-x86_64": {"url": "https://github.com/ogulcancelik/herdr/releases/download/v0.1.1/herdr-macos-x86_64"},
+                "macos-aarch64": {"url": "https://github.com/ogulcancelik/herdr/releases/download/v0.1.1/herdr-macos-aarch64"},
             },
         )
         self.assertEqual(manifest["releases"]["0.1.1"]["assets"], manifest["assets"])
@@ -304,13 +304,49 @@ class ChangelogScriptTests(unittest.TestCase):
                 "protocol": read_protocol_version(),
                 "notes": "### Fixed\n- One",
                 "assets": {
-                    "linux-x86_64": "https://example.com/linux-x86_64",
-                    "linux-aarch64": "https://example.com/linux-aarch64",
-                    "macos-x86_64": "https://example.com/macos-x86_64",
-                    "macos-aarch64": "https://example.com/macos-aarch64",
+                    "linux-x86_64": {"url": "https://example.com/linux-x86_64"},
+                    "linux-aarch64": {"url": "https://example.com/linux-aarch64"},
+                    "macos-x86_64": {"url": "https://example.com/macos-x86_64"},
+                    "macos-aarch64": {"url": "https://example.com/macos-aarch64"},
                 },
             },
         )
+
+    def test_manifest_from_release_payload_carries_sha256_from_digest(self) -> None:
+        digest = "sha256:ea490094f2c7c39099870857d00c64c628ef7b5eba1967df4258033455ee2cb1"
+        manifest = manifest_from_release_payload(
+            {
+                "tagName": "v0.1.1",
+                "isDraft": False,
+                "isPrerelease": False,
+                "body": "### Fixed\n- One\n",
+                "assets": [
+                    {
+                        "name": "herdr-linux-x86_64",
+                        "url": "https://example.com/linux-x86_64",
+                        "digest": digest,
+                    },
+                    {"name": "herdr-linux-aarch64", "url": "https://example.com/linux-aarch64"},
+                    {
+                        "name": "herdr-macos-x86_64",
+                        "url": "https://example.com/macos-x86_64",
+                        "digest": "not-a-valid-digest",
+                    },
+                    {"name": "herdr-macos-aarch64", "url": "https://example.com/macos-aarch64"},
+                ],
+            },
+            "0.1.1",
+        )
+
+        # Valid GitHub digest is carried as a bare lowercase sha256 hex.
+        self.assertEqual(
+            manifest["assets"]["linux-x86_64"]["sha256"],
+            "ea490094f2c7c39099870857d00c64c628ef7b5eba1967df4258033455ee2cb1",
+        )
+        # Missing or malformed digests are omitted rather than emitted broken.
+        self.assertNotIn("sha256", manifest["assets"]["linux-aarch64"])
+        self.assertNotIn("sha256", manifest["assets"]["macos-x86_64"])
+        self.assertNotIn("sha256", manifest["assets"]["macos-aarch64"])
 
     def test_manifest_from_release_payload_uses_explicit_protocol(self) -> None:
         manifest = manifest_from_release_payload(
@@ -392,15 +428,54 @@ class ChangelogScriptTests(unittest.TestCase):
             "protocol": read_protocol_version(),
             "notes": "### Fixed\n- One",
             "assets": {
+                "linux-x86_64": {"url": "https://example.com/linux-x86_64"},
+                "linux-aarch64": {"url": "https://example.com/linux-aarch64"},
+                "macos-x86_64": {"url": "https://example.com/macos-x86_64"},
+                "macos-aarch64": {"url": "https://example.com/macos-aarch64"},
+            },
+        }
+
+        canonical = ensure_manifest_matches_expected(actual, expected, "test manifest")
+        self.assertEqual(canonical, expected)
+
+    def test_ensure_manifest_matches_expected_ignores_sha256_presence(self) -> None:
+        # A legacy manifest (URL strings) and a fresh manifest (objects with
+        # sha256) for the same release must compare equal: sha256 is an
+        # integrity field, not release identity.
+        legacy = {
+            "version": "0.1.1",
+            "protocol": read_protocol_version(),
+            "notes": "### Fixed\n- One",
+            "assets": {
                 "linux-x86_64": "https://example.com/linux-x86_64",
                 "linux-aarch64": "https://example.com/linux-aarch64",
                 "macos-x86_64": "https://example.com/macos-x86_64",
                 "macos-aarch64": "https://example.com/macos-aarch64",
             },
         }
+        fresh = {
+            "version": "0.1.1",
+            "protocol": read_protocol_version(),
+            "notes": "### Fixed\n- One",
+            "assets": {
+                "linux-x86_64": {
+                    "url": "https://example.com/linux-x86_64",
+                    "sha256": "ea490094f2c7c39099870857d00c64c628ef7b5eba1967df4258033455ee2cb1",
+                },
+                "linux-aarch64": {
+                    "url": "https://example.com/linux-aarch64",
+                    "sha256": "b" * 64,
+                },
+                "macos-x86_64": {"url": "https://example.com/macos-x86_64"},
+                "macos-aarch64": {"url": "https://example.com/macos-aarch64"},
+            },
+        }
 
-        canonical = ensure_manifest_matches_expected(actual, expected, "test manifest")
-        self.assertEqual(canonical, expected)
+        canonical = ensure_manifest_matches_expected(legacy, fresh, "test manifest")
+        self.assertEqual(
+            canonical["assets"]["linux-x86_64"],
+            {"url": "https://example.com/linux-x86_64"},
+        )
 
     def test_current_release_assets_must_be_mirrored(self) -> None:
         assets = default_release_assets("0.1.1")
