@@ -19,7 +19,11 @@ use super::{
     CONNECTION_POLL_INTERVAL,
 };
 
-const MAX_STREAM_FRAME_HEADER_BYTES: usize = 64 * 1024;
+// 8 KiB is far above any real frame header JSON (~200 bytes). The header is read byte-by-byte
+// (one syscall per byte), so lowering this from 64 KiB cuts worst-case syscall amplification
+// 8x. A full fix would buffer reads (BufReader) but requires threading leftover bytes into the
+// frame-body reader; tracked as a deeper improvement, not done here.
+const MAX_STREAM_FRAME_HEADER_BYTES: usize = 8 * 1024;
 const STREAM_FRAME_BODY_CHUNK_BYTES: usize = 64 * 1024;
 const STREAM_FRAME_HEADER_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_FRAME_HEADER_TIMEOUT: Duration = Duration::from_secs(30);

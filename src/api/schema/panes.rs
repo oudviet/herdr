@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const PANE_GRAPHICS_SET_MAX_BYTES: usize = 512 * 1024;
-pub(crate) const PANE_GRAPHICS_STREAM_MAX_BYTES: usize = 16 * 1024 * 1024;
+// Bounded to 4 MiB per streamed frame. A terminal pane image rarely exceeds ~1 MiB of PNG;
+// the previous 16 MiB cap let a same-user client amplify server memory (16 MiB x N streams).
+// Combined with the concurrent-connection cap this bounds worst-case transient allocation.
+pub(crate) const PANE_GRAPHICS_STREAM_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 use super::agents::AgentSessionInfo;
 use super::common::{AgentStatus, PaneAgentState, ReadFormat, ReadSource, SplitDirection};

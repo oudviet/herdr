@@ -570,7 +570,12 @@ fn remote_install_prepare_script(remote_herdr: &RemoteHerdr) -> String {
 dest="$HOME/{install_suffix}"
 dir="${{dest%/*}}"
 mkdir -p "$dir"
-tmp="${{dest}}.tmp.$$"
+# mktemp creates a private, unpredictable temp path (mkstemp: O_CREAT|O_EXCL,
+# mode 0600) instead of a PID-predictable temp name. This closes a TOCTOU
+# symlink race where a same-user attacker on the remote could replace the
+# predictable temp name with a symlink to a victim file between prepare and
+# the `tee` stream step, causing the binary to be written over it.
+tmp="$(mktemp "${{dest}}.tmp.XXXXXX")"
 printf '%s\0%s\0' "$tmp" "$dest"
 "#,
         install_suffix = remote_herdr.install_suffix
@@ -2178,6 +2183,10 @@ mod tests {
         let prepare = remote_install_prepare_script(&remote_herdr);
 
         assert!(prepare.contains("mkdir -p \"$dir\""));
+        // Regression: temp path must be mktemp-generated (unpredictable, O_EXCL),
+        // not the PID-predictable "${dest}.tmp.$$" that enabled a symlink race.
+        assert!(prepare.contains("mktemp \"${dest}.tmp.XXXXXX\""));
+        assert!(!prepare.contains(".tmp.$$"));
         assert!(prepare.contains("printf '%s\\0%s\\0' \"$tmp\" \"$dest\""));
         assert_eq!(
             parse_remote_install_paths(b"/home/a b/herdr.tmp.42\0/home/a b/herdr\0").unwrap(),

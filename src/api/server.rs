@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,10 @@ pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
+/// Upper bound on concurrent API socket connections. Pane graphics streaming added the
+/// first long-lived API connections; without a cap, a same-user rogue client can open many
+/// streams and exhaust threads/file descriptors/memory. See security audit finding F1-B.
+const MAX_CONCURRENT_API_CONNECTIONS: usize = 64;
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -86,22 +90,39 @@ pub fn start_server_with_capabilities(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
+    let active_connections = Arc::new(AtomicUsize::new(0));
     let thread = std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    // Bound concurrent connections: reject (drop) once the cap is reached so a
+                    // flood of long-lived streams cannot exhaust server resources.
+                    if active_connections.fetch_add(1, Ordering::AcqRel)
+                        >= MAX_CONCURRENT_API_CONNECTIONS
+                    {
+                        active_connections.fetch_sub(1, Ordering::AcqRel);
+                        warn!(
+                            limit = MAX_CONCURRENT_API_CONNECTIONS,
+                            "api connection limit reached, rejecting connection"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     let api_tx = api_tx.clone();
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
                     let connection_running = Arc::clone(&listener_running);
+                    let active = Arc::clone(&active_connections);
                     std::thread::spawn(move || {
-                        if let Err(err) = handle_connection(
+                        let result = handle_connection(
                             stream,
                             &api_tx,
                             &event_hub,
                             &connection_running,
                             capabilities,
-                        ) {
+                        );
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        if let Err(err) = result {
                             warn!(err = %err, "api connection failed");
                         }
                     });
