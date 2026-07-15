@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,11 @@ const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+/// Upper bound on concurrent API socket connections. Long-lived API connections (event
+/// subscriptions, graphics transfers) mean that without a cap, a same-user rogue client
+/// can open many streams and exhaust threads/file descriptors/memory. See security
+/// audit finding F1-B.
+const MAX_CONCURRENT_API_CONNECTIONS: usize = 64;
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -118,21 +123,35 @@ fn start_server_inner(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
+    let active_connections = Arc::new(AtomicUsize::new(0));
     let thread = std::thread::spawn(move || {
         run_accept_loop(
             listener.incoming(),
             &listener_running,
             ACCEPT_ERROR_BACKOFF,
             |stream| {
+                // Bound concurrent connections: reject (drop) once the cap is reached so a
+                // flood of long-lived connections cannot exhaust server resources.
+                if active_connections.fetch_add(1, Ordering::AcqRel)
+                    >= MAX_CONCURRENT_API_CONNECTIONS
+                {
+                    active_connections.fetch_sub(1, Ordering::AcqRel);
+                    warn!(
+                        limit = MAX_CONCURRENT_API_CONNECTIONS,
+                        "api connection limit reached, rejecting connection"
+                    );
+                    return;
+                }
                 let api_tx = api_tx.clone();
                 let event_hub = event_hub.clone();
                 let capabilities = capabilities.clone();
                 let server_stop = server_stop.clone();
                 let connection_running = Arc::clone(&listener_running);
+                let active = Arc::clone(&active_connections);
                 #[cfg(unix)]
                 let ssh_agents = ssh_agents.clone();
                 std::thread::spawn(move || {
-                    if let Err(err) = handle_connection_with_stop(
+                    let result = handle_connection_with_stop(
                         stream,
                         &api_tx,
                         &event_hub,
@@ -141,7 +160,9 @@ fn start_server_inner(
                         server_stop.as_ref(),
                         #[cfg(unix)]
                         ssh_agents.as_ref(),
-                    ) {
+                    );
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    if let Err(err) = result {
                         warn!(err = %err, "api connection failed");
                     }
                 });
@@ -1336,6 +1357,52 @@ mod tests {
         let generic_error =
             r#"{"id":"req","error":{"code":"server_unavailable","message":"boom"}}"#;
         assert_eq!(api_response_outcome(generic_error), "error");
+    }
+
+    #[test]
+    fn api_connections_beyond_concurrency_cap_are_rejected() {
+        // Regression for security audit finding F1-B: the accept loop must bound
+        // concurrent connections. Hold the cap worth of idle connections (each
+        // spawned handler blocks reading its initial request), then verify one
+        // more connection is dropped instead of spawning another handler.
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle =
+            start_server_with_stop_control(api_tx, EventHub::default(), Arc::clone(&stop)).unwrap();
+
+        let mut held: Vec<LocalStream> = Vec::new();
+        for _ in 0..MAX_CONCURRENT_API_CONNECTIONS {
+            held.push(crate::ipc::connect_local_stream(&handle.path).unwrap());
+        }
+        // Let the accept loop drain the backlog of idle connections.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let mut beyond = crate::ipc::connect_local_stream(&handle.path).unwrap();
+        let mut byte = [0u8; 1];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            beyond
+                .set_recv_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            match beyond.read(&mut byte) {
+                Ok(0) => break, // dropped by the concurrency cap
+                Ok(n) => panic!("unexpected {n} bytes from rejected connection"),
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        || err.kind() == io::ErrorKind::TimedOut =>
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "connection beyond the concurrency cap was not dropped"
+                    );
+                }
+                Err(err) => panic!("unexpected read error from rejected connection: {err}"),
+            }
+        }
+
+        drop(held);
+        drop(beyond);
+        let _ = handle.remove_socket_file_if_owned();
     }
 
     #[test]
